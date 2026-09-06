@@ -149,77 +149,30 @@ jobs:
             echo "is_second_instance=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Force a build if the newest TestFlight build would expire before the next weekly run,
-      # so phones don't go dark when there are no upstream commits and the monthly build failed.
-      # Apple's API is retried with backoff; if it still fails, the decision falls back to the
-      # expiry date persisted in the LAST_KNOWN_BUILD_EXPIRY repo variable from the last good run.
+      # Force a build if the current TestFlight build would expire before the next weekly run.
+      # TestFlight builds live 90 days from upload; the build job records that date in the
+      # LAST_KNOWN_BUILD_EXPIRY repo variable after each upload, so no Apple API call is needed here.
       - name: Check TestFlight build expiry
         id: expiry-check
-        if: steps.workflow-permission.outputs.has_permission == 'true'
         env:
-          FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
-          FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
-          FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
-          TEAMID: ${{ secrets.TEAMID }}
-          GH_PAT: ${{ secrets.GH_PAT }}
-          REPO: ${{ github.repository }}
           LAST_KNOWN_BUILD_EXPIRY: ${{ vars.LAST_KNOWN_BUILD_EXPIRY }}
         run: |
-          pip install -q pyjwt cryptography requests
-          python3 - <<'EOF'
-          import os, sys, time, jwt, requests
-          from datetime import datetime, timezone
-          out = open(os.environ["GITHUB_OUTPUT"], "a")
-          summary = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
-          def log(msg): print(msg); summary.write(f"TestFlight expiry check: {msg}\n")
-          def finish(flag, msg):
-              log(msg); out.write(f"build_expiring={'true' if flag else 'false'}\n"); sys.exit(0)
-          def decide(exp, source):
-              days = (exp - datetime.now(timezone.utc)).total_seconds() / 86400
-              # the next scheduled run is 7 days away; build now if the current build won't survive until then
-              finish(days < 8, f"newest build expires {exp.date()} ({days:.1f} days, per {source}), " + ("forcing a build" if days < 8 else "no forced build needed"))
-
-          def fetch_expiry():
-              now = int(time.time())
-              tok = jwt.encode({"iss": os.environ["FASTLANE_ISSUER_ID"], "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
-                               os.environ["FASTLANE_KEY"], algorithm="ES256", headers={"kid": os.environ["FASTLANE_KEY_ID"]})
-              h = {"Authorization": f"Bearer {tok}"}
-              api = os.environ.get("ASC_API", "https://api.appstoreconnect.apple.com/v1")
-              bundle = f"com.{os.environ['TEAMID']}.loopkit.Loop"
-              r = requests.get(f"{api}/apps", headers=h, params={"filter[bundleId]": bundle}, timeout=30); r.raise_for_status()
-              apps = r.json()["data"]
-              if not apps: finish(False, f"no app with bundle id {bundle}, skipping")
-              r = requests.get(f"{api}/builds", headers=h, timeout=30,
-                               params={"filter[app]": apps[0]["id"], "sort": "-uploadedDate", "limit": 1}); r.raise_for_status()
-              builds = r.json()["data"]
-              if not builds: finish(True, "no TestFlight build found, forcing a build")
-              return datetime.fromisoformat(builds[0]["attributes"]["expirationDate"])
-
-          def persist(exp):
-              # remember the expiry in a repo variable so a later run can decide even if Apple is down
-              gh = {"Authorization": f"Bearer {os.environ['GH_PAT']}", "Accept": "application/vnd.github+json"}
-              url = f"https://api.github.com/repos/{os.environ['REPO']}/actions/variables"
-              body = {"name": "LAST_KNOWN_BUILD_EXPIRY", "value": exp.isoformat()}
-              r = requests.patch(f"{url}/LAST_KNOWN_BUILD_EXPIRY", headers=gh, json=body, timeout=30)
-              if r.status_code == 404: r = requests.post(url, headers=gh, json=body, timeout=30)
-              log(f"persisted expiry to repo variable: HTTP {r.status_code}" + ("" if r.ok else f" {r.text[:200]}"))
-
-          last_err = None
-          for attempt, wait in enumerate([0, 15, 30, 60, 120], 1):
-              time.sleep(wait)
-              try:
-                  exp = fetch_expiry()
-                  try: persist(exp)
-                  except Exception as e: log(f"could not persist expiry ({e})")
-                  decide(exp, "App Store Connect")
-              except SystemExit: raise
-              except Exception as e:
-                  last_err = e; log(f"attempt {attempt} failed: {e}")
-          known = os.environ.get("LAST_KNOWN_BUILD_EXPIRY", "").strip()
-          if known:
-              decide(datetime.fromisoformat(known), "persisted LAST_KNOWN_BUILD_EXPIRY, Apple unreachable")
-          finish(False, f"Apple unreachable after 5 attempts ({last_err}) and no persisted expiry, not forcing a build")
-          EOF
+          if [ -z "$LAST_KNOWN_BUILD_EXPIRY" ]; then
+            echo "LAST_KNOWN_BUILD_EXPIRY is not set (no build recorded yet), not forcing a build"
+            echo "build_expiring=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          NOW=$(date -u +%s)
+          EXPIRY=$(date -u -d "$LAST_KNOWN_BUILD_EXPIRY" +%s)
+          DAYS_LEFT=$(( (EXPIRY - NOW) / 86400 ))
+          # the next scheduled run is 7 days away; build now if the current build won't survive until then
+          if [ "$DAYS_LEFT" -lt 8 ]; then
+            echo "current TestFlight build expires $LAST_KNOWN_BUILD_EXPIRY ($DAYS_LEFT days left), forcing a build" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_expiring=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current TestFlight build expires $LAST_KNOWN_BUILD_EXPIRY ($DAYS_LEFT days left), no forced build needed" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_expiring=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Checks if Distribution certificate is present and valid, optionally nukes and
   # creates new certs if the repository variable ENABLE_NUKE_CERTS == 'true'
@@ -326,6 +279,18 @@ jobs:
           FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
           FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+
+      # TestFlight builds expire 90 days after upload. Record that so the weekly
+      # check can force a rebuild in time without asking Apple.
+      - name: Record TestFlight build expiry
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          EXPIRY=$(date -u -v+89d +%Y-%m-%dT%H:%M:%SZ)
+          echo "recording TestFlight build expiry $EXPIRY in repo variable LAST_KNOWN_BUILD_EXPIRY" | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! gh variable set LAST_KNOWN_BUILD_EXPIRY --body "$EXPIRY" --repo "$GITHUB_REPOSITORY"; then
+            echo "::warning::could not record build expiry; the weekly expiry check will use the previous value"
+          fi
 
       # Upload Build artifacts
       - name: Upload build log, IPA and Symbol artifacts
