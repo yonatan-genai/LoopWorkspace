@@ -22,8 +22,7 @@ jobs:
       contents: write
     outputs:
       NEW_COMMITS: ${{ steps.sync.outputs.has_new_commits }}
-      IS_SECOND_IN_MONTH: ${{ steps.date-check.outputs.is_second_instance }}
-      BUILD_EXPIRING: ${{ steps.expiry-check.outputs.build_expiring }}
+      BUILD_DUE: ${{ steps.build-age.outputs.build_due }}
 
     # Check GH_PAT, sync repository, check day in month
     steps:
@@ -137,41 +136,28 @@ jobs:
           echo "If you want to enable automatic builds and updates for your Loop, please follow the instructions \
                 under the following path <code>LoopWorkspace/fastlane/testflight.md</code>." >> $GITHUB_STEP_SUMMARY
 
-      # Set a logic flag if this is the second instance of this day-of-week in this month
-      - name: Check if this is the second time this day-of-week happens this month
-        id: date-check
-        run: |
-          DAY_OF_MONTH=$(date +%-d)
-          WEEK_OF_MONTH=$(( ($(date +%-d) - 1) / 7 + 1 ))
-          if [[ $WEEK_OF_MONTH -eq 2 ]]; then
-            echo "is_second_instance=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_second_instance=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Force a build if the current TestFlight build would expire before the next weekly run.
-      # TestFlight builds live 90 days from upload; the build job records that date in the
-      # LAST_KNOWN_BUILD_EXPIRY repo variable after each upload, so no Apple API call is needed here.
-      - name: Check TestFlight build expiry
-        id: expiry-check
+      # Rebuild roughly every 30 days so TestFlight builds (90-day lifetime) never go stale.
+      # The build job records the upload time in the LAST_BUILD_DATE repo variable. Runs are
+      # 7 days apart, so the first run at >= 26.5 days is the one closest to the 30-day mark.
+      - name: Check age of last TestFlight build
+        id: build-age
         env:
-          LAST_KNOWN_BUILD_EXPIRY: ${{ vars.LAST_KNOWN_BUILD_EXPIRY }}
+          LAST_BUILD_DATE: ${{ vars.LAST_BUILD_DATE }}
         run: |
-          if [ -z "$LAST_KNOWN_BUILD_EXPIRY" ]; then
-            echo "LAST_KNOWN_BUILD_EXPIRY is not set (no build recorded yet), not forcing a build"
-            echo "build_expiring=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$LAST_BUILD_DATE" ]; then
+            echo "LAST_BUILD_DATE is not set (no build recorded yet), building" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_due=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           NOW=$(date -u +%s)
-          EXPIRY=$(date -u -d "$LAST_KNOWN_BUILD_EXPIRY" +%s)
-          DAYS_LEFT=$(( (EXPIRY - NOW) / 86400 ))
-          # the next scheduled run is 7 days away; build now if the current build won't survive until then
-          if [ "$DAYS_LEFT" -lt 8 ]; then
-            echo "current TestFlight build expires $LAST_KNOWN_BUILD_EXPIRY ($DAYS_LEFT days left), forcing a build" | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "build_expiring=true" >> "$GITHUB_OUTPUT"
+          LAST=$(date -u -d "$LAST_BUILD_DATE" +%s)
+          AGE_DAYS=$(( (NOW - LAST) / 86400 ))
+          if [ $(( NOW - LAST )) -ge 2289600 ]; then   # 26.5 days in seconds
+            echo "last TestFlight build was $LAST_BUILD_DATE ($AGE_DAYS days ago), building" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_due=true" >> "$GITHUB_OUTPUT"
           else
-            echo "current TestFlight build expires $LAST_KNOWN_BUILD_EXPIRY ($DAYS_LEFT days left), no forced build needed" | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "build_expiring=false" >> "$GITHUB_OUTPUT"
+            echo "last TestFlight build was $LAST_BUILD_DATE ($AGE_DAYS days ago), no build needed yet" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_due=false" >> "$GITHUB_OUTPUT"
           fi
 
   # Checks if Distribution certificate is present and valid, optionally nukes and
@@ -184,8 +170,7 @@ jobs:
       secrets: inherit
       if: |
         github.event_name == 'workflow_dispatch' ||
-          (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.IS_SECOND_IN_MONTH == 'true') ||
-        (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_EXPIRING == 'true') ||
+          (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') ||
           (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
 
   # Builds Loop
@@ -196,10 +181,9 @@ jobs:
     permissions:
       contents: write
     if:
-      | # builds with manual start; if scheduled: once a month, when new commits are found, or when the current TestFlight build is about to expire
+      | # builds with manual start; if scheduled: about every 30 days or when new commits are found
       github.event_name == 'workflow_dispatch' ||
-        (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.IS_SECOND_IN_MONTH == 'true') ||
-        (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_EXPIRING == 'true') ||
+        (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') ||
         (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
     steps:
       - name: Select Xcode version
@@ -280,16 +264,15 @@ jobs:
           FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
 
-      # TestFlight builds expire 90 days after upload. Record that so the weekly
-      # check can force a rebuild in time without asking Apple.
-      - name: Record TestFlight build expiry
+      # Record the upload time so the weekly check can rebuild about every 30 days
+      - name: Record TestFlight build date
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          EXPIRY=$(date -u -v+89d +%Y-%m-%dT%H:%M:%SZ)
-          echo "recording TestFlight build expiry $EXPIRY in repo variable LAST_KNOWN_BUILD_EXPIRY" | tee -a "$GITHUB_STEP_SUMMARY"
-          if ! gh variable set LAST_KNOWN_BUILD_EXPIRY --body "$EXPIRY" --repo "$GITHUB_REPOSITORY"; then
-            echo "::warning::could not record build expiry; the weekly expiry check will use the previous value"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "recording TestFlight build date $NOW in repo variable LAST_BUILD_DATE" | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! gh variable set LAST_BUILD_DATE --body "$NOW" --repo "$GITHUB_REPOSITORY"; then
+            echo "::warning::could not record build date; the next scheduled run will build again"
           fi
 
       # Upload Build artifacts
