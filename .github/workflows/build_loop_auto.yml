@@ -1,7 +1,11 @@
-name: 4. Build Loop Manual
-run-name: Build Loop Manual (${{ github.ref_name }})
+name: 4. Build Loop Auto 
+run-name: Build Loop Auto (${{ github.ref_name }})
 on:
   workflow_dispatch:
+  schedule:
+    # Check for updates every Saturday
+    #   Later logic builds if there are updates or if it is the 2nd Saturday of the month
+    - cron: "33 7 * * 6" # Saturday at UTC 7:33
 
 env:
   GH_PAT: ${{ secrets.GH_PAT }}
@@ -18,7 +22,7 @@ jobs:
       contents: write
     outputs:
       NEW_COMMITS: ${{ steps.sync.outputs.has_new_commits }}
-      IS_SECOND_IN_MONTH: ${{ steps.date-check.outputs.is_second_instance }}
+      BUILD_DUE: ${{ steps.build-age.outputs.build_due }}
 
     # Check GH_PAT, sync repository, check day in month
     steps:
@@ -132,17 +136,53 @@ jobs:
           echo "If you want to enable automatic builds and updates for your Loop, please follow the instructions \
                 under the following path <code>LoopWorkspace/fastlane/testflight.md</code>." >> $GITHUB_STEP_SUMMARY
 
-      # Set a logic flag if this is the second instance of this day-of-week in this month
-      - name: Check if this is the second time this day-of-week happens this month
-        id: date-check
+      # Rebuild roughly every 30 days so TestFlight builds (90-day lifetime) never go stale.
+      # The build job records the upload time in the LAST_BUILD_DATE repo variable. Runs are
+      # 7 days apart, so the first run at >= 26.5 days is the one closest to the 30-day mark.
+      - name: Check age of last TestFlight build
+        id: build-age
+        env:
+          LAST_BUILD_DATE: ${{ vars.LAST_BUILD_DATE }}
         run: |
-          DAY_OF_MONTH=$(date +%-d)
-          WEEK_OF_MONTH=$(( ($(date +%-d) - 1) / 7 + 1 ))
-          if [[ $WEEK_OF_MONTH -eq 2 ]]; then
-            echo "is_second_instance=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_second_instance=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$LAST_BUILD_DATE" ]; then
+            echo "LAST_BUILD_DATE is not set (no build recorded yet), building" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_due=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          NOW=$(date -u +%s)
+          LAST=$(date -u -d "$LAST_BUILD_DATE" +%s)
+          AGE_DAYS=$(( (NOW - LAST) / 86400 ))
+          if [ $(( NOW - LAST )) -ge 2289600 ]; then   # 26.5 days in seconds
+            echo "last TestFlight build was $LAST_BUILD_DATE ($AGE_DAYS days ago), building" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_due=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "last TestFlight build was $LAST_BUILD_DATE ($AGE_DAYS days ago), no build needed yet" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "build_due=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # When a scheduled run finds nothing new to build, cancel the run so it shows
+  # as "cancelled" instead of "success" — a green check should always mean a
+  # new build was made.
+  cancel_when_no_build:
+    needs: check_status
+    name: Cancel run when there is nothing to build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    if: |
+      github.event_name == 'schedule' &&
+        !(vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') &&
+        !(vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true')
+    steps:
+      - name: Cancel the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Repository is up to date and no 30-day rebuild is due — cancelling this run so it is not reported as a successful build." >> "$GITHUB_STEP_SUMMARY"
+          gh run cancel ${{ github.run_id }} --repo ${{ github.repository }}
+          # Keep the job alive until the cancellation lands, so the run ends as
+          # "cancelled" rather than completing successfully first.
+          sleep 300
 
   # Checks if Distribution certificate is present and valid, optionally nukes and
   # creates new certs if the repository variable ENABLE_NUKE_CERTS == 'true'
@@ -154,7 +194,7 @@ jobs:
       secrets: inherit
       if: |
         github.event_name == 'workflow_dispatch' ||
-          (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.IS_SECOND_IN_MONTH == 'true') ||
+          (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') ||
           (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
 
   # Builds Loop
@@ -165,9 +205,9 @@ jobs:
     permissions:
       contents: write
     if:
-      | # builds with manual start; if scheduled: once a month or when new commits are found
+      | # builds with manual start; if scheduled: about every 30 days or when new commits are found
       github.event_name == 'workflow_dispatch' ||
-        (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.IS_SECOND_IN_MONTH == 'true') ||
+        (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') ||
         (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
     steps:
       - name: Select Xcode version
@@ -248,7 +288,7 @@ jobs:
           FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
 
-      # Record the upload time so the weekly auto check can rebuild about every 30 days
+      # Record the upload time so the weekly check can rebuild about every 30 days
       - name: Record TestFlight build date
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
