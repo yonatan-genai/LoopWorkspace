@@ -185,10 +185,11 @@ jobs:
           # "cancelled" rather than completing successfully first.
           sleep 300
 
-  # Fork: renew only the Loop distribution certificate when it expires within 30 days
+  # Fork: renew only the Loop distribution certificate when it expires within
+  # LOOP_CERT_RENEW_DAYS days (repo variable, default 30)
   # (fastlane/RenewLoopCert). Upstream's create_certs.yml would `match nuke` every
   # distribution certificate on the team. Runs every week, even when no build is due,
-  # so the 30-day window is never missed. LOOP_CERT_DRY_RUN=true only reports.
+  # so the renewal window is never missed. LOOP_CERT_DRY_RUN=true only reports.
   check_certs:
       needs: [check_status]
       name: Check certificates

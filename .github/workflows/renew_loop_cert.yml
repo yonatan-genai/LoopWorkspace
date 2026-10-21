@@ -19,7 +19,7 @@ on:
       dry_run:
         description: Only report which certificates would be created and revoked
         type: boolean
-        default: true
+        default: false
 
 env:
   TEAMID: ${{ secrets.TEAMID }}
@@ -63,9 +63,10 @@ jobs:
       - name: Sync clock
         run: sudo sntp -sS time.windows.com
 
-      - name: Renew Loop certificate if it expires within 30 days
+      - name: Renew Loop certificate if it expires within LOOP_CERT_RENEW_DAYS (default 30)
         env:
           LOOP_CERT_DRY_RUN: ${{ inputs.dry_run }}
+          LOOP_CERT_RENEW_DAYS: ${{ vars.LOOP_CERT_RENEW_DAYS || '30' }}
         run: bundle exec fastlane renew_loop_cert
 
       - name: Set outputs
