@@ -27,3 +27,4 @@ xcuserdata/
 *.playground
 playground.xcworkspace
 timeline.xctimeline
+fastlane/loop_cert_result.txt

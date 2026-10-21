@@ -1,0 +1,103 @@
+# Fork addition. Renews only the Loop distribution certificate, never `match nuke`,
+# so other apps on the same Apple team keep their certificates. See fastlane/RenewLoopCert.
+name: 3b. Renew Loop Certificate
+run-name: Renew Loop Certificate (${{ github.ref_name }})
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+    outputs:
+      renewed:
+        value: ${{ jobs.renew.outputs.renewed }}
+      old_cert_id:
+        value: ${{ jobs.renew.outputs.old_cert_id }}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only report which certificates would be created and revoked
+        type: boolean
+        default: true
+
+env:
+  TEAMID: ${{ secrets.TEAMID }}
+  GH_PAT: ${{ secrets.GH_PAT }}
+  GH_TOKEN: ${{ secrets.GH_PAT }}
+  MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+  FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
+  FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
+  FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
+
+jobs:
+  validate:
+    name: Validate
+    uses: ./.github/workflows/validate_secrets.yml
+    secrets: inherit
+
+  renew:
+    name: Renew Loop certificate
+    needs: validate
+    runs-on: xcode-27
+    outputs:
+      renewed: ${{ steps.result.outputs.renewed }}
+      old_cert_id: ${{ steps.result.outputs.old_cert_id }}
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+
+      - name: Patch Match Tables
+        run: |
+          TABLE_PRINTER_PATH=$(ruby -e 'puts Gem::Specification.find_by_name("fastlane").gem_dir')/match/lib/match/table_printer.rb
+          if [ -f "$TABLE_PRINTER_PATH" ]; then
+            sed -i "" "/puts(Terminal::Table.new(params))/d" "$TABLE_PRINTER_PATH"
+          else
+            echo "table_printer.rb not found"
+            exit 1
+          fi
+
+      - name: Install Project Dependencies
+        run: bundle install
+
+      - name: Sync clock
+        run: sudo sntp -sS time.windows.com
+
+      - name: Renew Loop certificate if it expires within 30 days
+        env:
+          LOOP_CERT_DRY_RUN: ${{ inputs.dry_run }}
+        run: bundle exec fastlane renew_loop_cert
+
+      - name: Set outputs
+        id: result
+        if: always()
+        run: |
+          RESULT="${{ github.workspace }}/fastlane/loop_cert_result.txt"
+          [ -f "$RESULT" ] || { echo "no result file"; exit 0; }
+          ACTION=$(sed -n 's/^action=//p' "$RESULT")
+          OLD=$(sed -n 's/^old_cert_id=//p' "$RESULT")
+          NEW=$(sed -n 's/^new_cert_id=//p' "$RESULT")
+          echo "renewal: action=$ACTION old=$OLD new=$NEW dry_run=${{ inputs.dry_run }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$ACTION" = "renewed" ] && echo "renewed=true" >> "$GITHUB_OUTPUT" || echo "renewed=false" >> "$GITHUB_OUTPUT"
+          echo "old_cert_id=$OLD" >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+
+      # Email when a renewal is due and cannot proceed. Needs the RESEND_API_KEY secret;
+      # without it GitHub's own failed-run email is the alert.
+      - name: Email alert on failure
+        if: failure()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$RESEND_API_KEY" ] || [ -z "$ALERT_TO" ]; then
+            echo "::error::Loop certificate renewal failed. RESEND_API_KEY or CERT_ALERT_EMAIL is not set, so no email was sent."
+            exit 0
+          fi
+          jq -n --arg to "$ALERT_TO" --arg url "$RUN_URL" '{
+            from: "Horan Alerts <alerts@horan.casa>", to: [$to],
+            subject: "Loop certificate renewal failed, nothing was revoked",
+            text: ("The Loop distribution certificate needs renewal and the workflow stopped before changing anything on Apple. Most likely all distribution certificate slots are in use.\n\nRun: " + $url)
+          }' | curl -sS --fail-with-body -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" -H "Content-Type: application/json" -d @-

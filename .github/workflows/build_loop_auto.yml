@@ -164,7 +164,7 @@ jobs:
   # as "cancelled" instead of "success" — a green check should always mean a
   # new build was made.
   cancel_when_no_build:
-    needs: check_status
+    needs: [check_status, check_certs]
     name: Cancel run when there is nothing to build
     runs-on: ubuntu-26.04
     permissions:
@@ -172,7 +172,8 @@ jobs:
     if: |
       github.event_name == 'schedule' &&
         !(vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') &&
-        !(vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true')
+        !(vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true') &&
+        needs.check_certs.outputs.renewed != 'true'
     steps:
       - name: Cancel the run
         env:
@@ -184,18 +185,17 @@ jobs:
           # "cancelled" rather than completing successfully first.
           sleep 300
 
-  # Checks if Distribution certificate is present and valid, optionally nukes and
-  # creates new certs if the repository variable ENABLE_NUKE_CERTS == 'true'
-  # only run if a build is planned
+  # Fork: renew only the Loop distribution certificate when it expires within 30 days
+  # (fastlane/RenewLoopCert). Upstream's create_certs.yml would `match nuke` every
+  # distribution certificate on the team. Runs every week, even when no build is due,
+  # so the 30-day window is never missed. LOOP_CERT_DRY_RUN=true only reports.
   check_certs:
       needs: [check_status]
       name: Check certificates
-      uses: ./.github/workflows/create_certs.yml
+      uses: ./.github/workflows/renew_loop_cert.yml
       secrets: inherit
-      if: |
-        github.event_name == 'workflow_dispatch' ||
-          (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') ||
-          (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
+      with:
+        dry_run: ${{ vars.LOOP_CERT_DRY_RUN == 'true' }}
 
   # Builds Loop
   build:
@@ -205,10 +205,11 @@ jobs:
     permissions:
       contents: write
     if:
-      | # builds with manual start; if scheduled: about every 30 days or when new commits are found
+      | # builds with manual start; if scheduled: about every 30 days, when new commits are found, or after a certificate renewal
       github.event_name == 'workflow_dispatch' ||
         (vars.SCHEDULED_BUILD != 'false' && needs.check_status.outputs.BUILD_DUE == 'true') ||
-        (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
+        (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' ) ||
+        needs.check_certs.outputs.renewed == 'true'
     steps:
       - name: Select Xcode version
         run: "sudo xcode-select --switch /Applications/Xcode_27.0.app/Contents/Developer"
@@ -308,3 +309,27 @@ jobs:
           path: |
             artifacts
             buildlog
+
+  # Fork: after a good build with the renewed certificate, revoke the old Loop
+  # certificate by its id. Nothing else on the team is touched.
+  revoke_old_cert:
+    name: Revoke old Loop certificate
+    needs: [check_certs, build]
+    runs-on: xcode-27
+    if: needs.check_certs.outputs.renewed == 'true' && needs.check_certs.outputs.old_cert_id != '' && needs.build.result == 'success'
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+
+      - name: Install Project Dependencies
+        run: bundle install
+
+      - name: Revoke old Loop certificate
+        run: bundle exec fastlane revoke_loop_cert
+        env:
+          LOOP_OLD_CERT_ID: ${{ needs.check_certs.outputs.old_cert_id }}
+          TEAMID: ${{ secrets.TEAMID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
+          FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
+          FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
