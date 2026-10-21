@@ -322,3 +322,5 @@ platform :ios do
     puts "Certificate creation or renewal needed: #{new_certificate_needed_content}"
   end
 end
+# Fork addition: targeted Loop certificate renewal without match nuke
+import("RenewLoopCert")
