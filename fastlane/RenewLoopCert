@@ -55,6 +55,11 @@ def write_loop_result(values)
   UI.message("Result (#{LOOP_RESULT_FILE}): #{values.map { |k, v| "#{k}=#{v}" }.join(' ')}")
 end
 
+# The renewal stage in progress, so a failure alert can say what failed.
+def loop_stage(text)
+  File.write(File.expand_path("loop_cert_stage.txt"), text + "\n")
+end
+
 def days_left(cert)
   ((Time.parse(cert.expiration_date) - Time.now) / 86_400).floor
 end
@@ -82,6 +87,41 @@ def print_inventory(inventory, stored_ids)
 end
 
 platform :ios do
+  desc "Report which Loop certificate is active and whether Loop can still be signed (for failure alerts)"
+  lane :loop_cert_state do
+    app_store_connect_api_key(
+      key_id: "#{FASTLANE_KEY_ID}",
+      issuer_id: "#{FASTLANE_ISSUER_ID}",
+      key_content: "#{FASTLANE_KEY}"
+    )
+    stored_ids = stored_cert_ids(clone_match_secrets)
+    inventory = distribution_inventory
+    profiles = Spaceship::ConnectAPI::Profile.all(includes: "bundleId,certificates")
+    lines = ["Match-Secrets holds: #{stored_ids.empty? ? 'no certificate' : stored_ids.join(', ')}"]
+    inventory.each do |entry|
+      cert = entry[:cert]
+      tag = stored_ids.include?(cert.id) ? " [in Match-Secrets]" : ""
+      lines << "On Apple: #{cert.id} '#{cert.name}' expires #{cert.expiration_date[0, 10]} (#{days_left(cert)} days)#{tag}"
+    end
+    active = inventory.map { |e| e[:cert] }.find { |c| stored_ids.include?(c.id) && days_left(c) >= 0 }
+    missing = loop_app_identifiers.reject do |identifier|
+      profiles.any? do |p|
+        p.profile_type == "IOS_APP_STORE" && p.profile_state == "ACTIVE" && p.bundle_id && p.bundle_id.identifier == identifier &&
+          active && (p.certificates || []).any? { |c| c.id == active.id }
+      end
+    end
+    lines << if active.nil?
+               "Loop CANNOT build: no valid certificate in Match-Secrets."
+             elsif missing.empty?
+               "Loop can build: #{active.id} is valid and all #{loop_app_identifiers.count} Loop profiles use it."
+             else
+               "Loop CANNOT build yet: #{active.id} is valid but these profiles do not use it: #{missing.join(', ')}."
+             end
+    lines << "Installed Loop on the phone keeps working until its TestFlight build expires (90 days after upload)."
+    File.write(File.expand_path("loop_cert_state.txt"), lines.join("\n") + "\n")
+    lines.each { |line| UI.message(line) }
+  end
+
   desc "Renew only the Loop distribution certificate when it is close to expiry (no nuke)"
   lane :renew_loop_cert do |options|
     setup_ci if ENV['CI']
@@ -89,6 +129,7 @@ platform :ios do
     renew_days = (options[:renew_days] || ENV["LOOP_CERT_RENEW_DAYS"] || 30).to_i
     max_certs = (options[:max_certs] || ENV["LOOP_CERT_MAX_DISTRIBUTION"] || 3).to_i
 
+    loop_stage("reading the certificate inventory (App Store Connect API or Match-Secrets clone); nothing was changed")
     app_store_connect_api_key(
       key_id: "#{FASTLANE_KEY_ID}",
       issuer_id: "#{FASTLANE_ISSUER_ID}",
@@ -116,6 +157,7 @@ platform :ios do
     old_id = loop_cert ? loop_cert.id : ""
 
     if free_slots < 1
+      loop_stage("no free distribution certificate slot (#{active.count} of #{max_certs} in use); nothing was created or revoked")
       write_loop_result(action: "no_slot", old_cert_id: old_id, new_cert_id: "", dry_run: dry_run)
       message = "Loop needs a new distribution certificate (#{reason}), but all #{max_certs} slots are in use. " \
                 "Nothing was created or revoked. Free a slot by hand (revoke a certificate no app uses), then run again."
@@ -131,6 +173,7 @@ platform :ios do
       next
     end
 
+    loop_stage("retiring #{stored_ids.join(', ')} from Match-Secrets (git rm, commit, push)")
     # Retire the old files from Match-Secrets so match creates a new certificate.
     # Git history keeps them; Apple keeps the certificate valid until revoke_loop_cert.
     stored_ids.each do |id|
@@ -142,6 +185,7 @@ platform :ios do
       sh("git", "-C", dir, "-c", "http.extraheader=AUTHORIZATION: basic #{loop_match_auth}", "push", "--quiet", "origin", "master", log: false)
     end
 
+    loop_stage("match creating the new certificate and regenerating the Loop profiles, after #{stored_ids.join(', ')} was removed from Match-Secrets")
     ENV["MATCH_READONLY"] = false.to_s
     match(
       type: "appstore",
@@ -150,6 +194,7 @@ platform :ios do
       app_identifier: loop_app_identifiers
     )
 
+    loop_stage("checking that match stored the new certificate in Match-Secrets")
     new_ids = stored_cert_ids(clone_match_secrets)
     new_id = (new_ids - stored_ids).first
     UI.user_error!("match did not store a new certificate (Match-Secrets holds #{new_ids.join(', ')})") if new_id.nil?
@@ -169,6 +214,7 @@ platform :ios do
       key_content: "#{FASTLANE_KEY}"
     )
 
+    loop_stage("revoking old Loop certificate #{cert_id}: guard checks")
     stored_ids = stored_cert_ids(clone_match_secrets)
     UI.user_error!("#{cert_id} is still in Match-Secrets, refusing to revoke the certificate Loop builds with") if stored_ids.include?(cert_id)
 
@@ -184,6 +230,7 @@ platform :ios do
       UI.important("DRY RUN: would revoke #{cert_id} '#{entry[:cert].name}' (expires #{entry[:cert].expiration_date})")
       next
     end
+    loop_stage("revoking old Loop certificate #{cert_id}: Apple API call")
     entry[:cert].delete!
     UI.success("Revoked old Loop distribution certificate #{cert_id}")
   end

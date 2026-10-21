@@ -82,8 +82,12 @@ jobs:
           echo "old_cert_id=$OLD" >> "$GITHUB_OUTPUT"
           echo "action=$ACTION" >> "$GITHUB_OUTPUT"
 
-      # Email when a renewal is due and cannot proceed. Needs the RESEND_API_KEY secret;
-      # without it GitHub's own failed-run email is the alert.
+      # Any failed step above: report what is active on Apple and in Match-Secrets,
+      # then email it from alerts@horan.casa.
+      - name: Report certificate state
+        if: failure()
+        run: bundle exec fastlane loop_cert_state || echo "state check failed"
+
       - name: Email alert on failure
         if: failure()
         env:
@@ -91,13 +95,22 @@ jobs:
           ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "$RESEND_API_KEY" ] || [ -z "$ALERT_TO" ]; then
-            echo "::error::Loop certificate renewal failed. RESEND_API_KEY or CERT_ALERT_EMAIL is not set, so no email was sent."
-            exit 0
-          fi
-          jq -n --arg to "$ALERT_TO" --arg url "$RUN_URL" '{
-            from: "Horan Alerts <alerts@horan.casa>", to: [$to],
-            subject: "Loop certificate renewal failed, nothing was revoked",
-            text: ("The Loop distribution certificate needs renewal and the workflow stopped before changing anything on Apple. Most likely all distribution certificate slots are in use.\n\nRun: " + $url)
-          }' | curl -sS --fail-with-body -X POST https://api.resend.com/emails \
-            -H "Authorization: Bearer $RESEND_API_KEY" -H "Content-Type: application/json" -d @-
+          WHAT=$(cat fastlane/loop_cert_stage.txt 2>/dev/null || echo "a setup step before fastlane ran (checkout, bundle install or clock sync); nothing was changed")
+          bash .github/scripts/loop_cert_alert.sh "Loop certificate renewal failed" "$WHAT"
+
+  # The secrets check failed, so the renewal never ran.
+  alert_validate:
+    name: Alert on failed secrets check
+    needs: validate
+    if: failure()
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+
+      - name: Email alert
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash .github/scripts/loop_cert_alert.sh "Loop certificate check could not run" "the secrets check (validate_secrets) failed, so the certificate renewal never ran; nothing was changed"

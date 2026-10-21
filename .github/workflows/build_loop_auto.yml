@@ -333,3 +333,44 @@ jobs:
           FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
           FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
           FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
+
+  # Fork: email when the build after a renewal fails, or the old certificate could not be
+  # revoked. Failures inside the renewal itself are emailed by renew_loop_cert.yml.
+  alert_renewal:
+    name: Alert on failed renewal follow-up
+    needs: [check_certs, build, revoke_old_cert]
+    runs-on: xcode-27
+    if: |
+      always() && needs.check_certs.outputs.renewed == 'true' &&
+        (needs.build.result != 'success' || (needs.check_certs.outputs.old_cert_id != '' && needs.revoke_old_cert.result != 'success'))
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v5
+
+      - name: Install Project Dependencies
+        run: bundle install
+
+      - name: Report certificate state
+        run: bundle exec fastlane loop_cert_state || echo "state check failed"
+        env:
+          TEAMID: ${{ secrets.TEAMID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          FASTLANE_KEY_ID: ${{ secrets.FASTLANE_KEY_ID }}
+          FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
+          FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
+
+      - name: Email alert
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          REVOKE_RESULT: ${{ needs.revoke_old_cert.result }}
+          OLD_CERT_ID: ${{ needs.check_certs.outputs.old_cert_id }}
+        run: |
+          if [ "$BUILD_RESULT" != "success" ]; then
+            WHAT="the Loop build after the certificate renewal ended with '$BUILD_RESULT'. Old certificate $OLD_CERT_ID was NOT revoked."
+          else
+            WHAT="the build passed, but revoking old certificate $OLD_CERT_ID ended with '$REVOKE_RESULT' (refused or API error). It still holds a slot until revoked by hand or it expires."
+          fi
+          bash .github/scripts/loop_cert_alert.sh "Loop certificate renewal failed after renewal" "$WHAT"
