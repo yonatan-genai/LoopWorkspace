@@ -92,6 +92,7 @@ jobs:
         if: failure()
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_HMAC_KEY: ${{ secrets.ALERT_HMAC_KEY }}
           ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -111,6 +112,7 @@ jobs:
       - name: Email alert
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_HMAC_KEY: ${{ secrets.ALERT_HMAC_KEY }}
           ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: bash .github/scripts/loop_cert_alert.sh "Loop certificate check could not run" "the secrets check (validate_secrets) failed, so the certificate renewal never ran; nothing was changed"

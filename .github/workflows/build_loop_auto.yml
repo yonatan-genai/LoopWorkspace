@@ -362,6 +362,7 @@ jobs:
       - name: Email alert
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          ALERT_HMAC_KEY: ${{ secrets.ALERT_HMAC_KEY }}
           ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           BUILD_RESULT: ${{ needs.build.result }}
