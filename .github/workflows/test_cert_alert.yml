@@ -36,4 +36,4 @@ jobs:
           ALERT_SEVERITY: info
           ALERT_TO: ${{ vars.CERT_ALERT_EMAIL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: bash .github/scripts/loop_cert_alert.sh "[TEST] Loop certificate renewal failed" "TEST ONLY, nothing failed. This proves the failure email works; a real alert names the failed stage here."
+        run: bash .github/scripts/loop_cert_alert.sh "[TEST] Loop certificate renewal failed" "TEST ONLY, nothing failed. This proves the failure email works; a real alert names the failed stage here (worker first, Resend fallback)."
